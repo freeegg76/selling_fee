@@ -1,6 +1,8 @@
 .env
 credential.json
 service-account.json
+oauth_client_secret.json
+gmail_token.json
 output/
 __pycache__/
 *.pyc

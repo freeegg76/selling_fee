@@ -3,7 +3,7 @@
 ## 역할
 
 고객사 발송용 Gmail Draft와 에스컬레이션용 Gmail Draft를 생성한다.
-`info@forsit.co.kr` 계정으로 Domain-Wide Delegation 방식 impersonate.
+`info@forsit.co.kr` 계정으로 OAuth 2.0 인증 (첫 실행 시 브라우저 승인, 이후 `gmail_token.json` 재사용).
 
 ## 고객사 발송용 Draft
 

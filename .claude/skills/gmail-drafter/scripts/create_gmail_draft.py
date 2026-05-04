@@ -2,7 +2,7 @@
 고객사 발송용 Gmail Draft 생성기.
 
 SP_Get_Contact_Mail로 수신자 조회 후 Invoice / Revenue Report / Transaction Report 첨부.
-info@forsit.co.kr 계정으로 impersonate하여 Draft 생성.
+OAuth 2.0으로 info@forsit.co.kr 계정 인증 (첫 실행 시 브라우저 승인 필요).
 
 Usage:
   python create_gmail_draft.py --yyyymm 202504 --company_code ABC --company_name "홍길동상사"
@@ -19,7 +19,9 @@ from pathlib import Path
 
 import pyodbc
 from dotenv import load_dotenv
-from google.oauth2 import service_account
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 
@@ -34,8 +36,8 @@ ROOT = find_project_root()
 load_dotenv(ROOT / ".env")
 
 GMAIL_FROM = os.getenv("GMAIL_FROM", "info@forsit.co.kr")
-CREDENTIALS_FILE = str(ROOT / os.getenv("GOOGLE_CREDENTIALS_FILE", "credential.json"))
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.compose"]
+TOKEN_PATH = str(ROOT / "gmail_token.json")
 
 SUBJECT_TEMPLATE = "[아마존_Invoice] {company_name} Selling Fee invoice {yyyymm}"
 BODY_TEMPLATE = (
@@ -46,10 +48,19 @@ BODY_TEMPLATE = (
 
 
 def _get_gmail():
-    creds = service_account.Credentials.from_service_account_file(
-        CREDENTIALS_FILE, scopes=GMAIL_SCOPES
-    )
-    return build("gmail", "v1", credentials=creds.with_subject(GMAIL_FROM))
+    client_secret = os.getenv("OAUTH_CLIENT_SECRET", str(ROOT / "oauth_client_secret.json"))
+    creds = None
+    if os.path.exists(TOKEN_PATH):
+        creds = Credentials.from_authorized_user_file(TOKEN_PATH, GMAIL_SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(client_secret, GMAIL_SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open(TOKEN_PATH, "w") as f:
+            f.write(creds.to_json())
+    return build("gmail", "v1", credentials=creds)
 
 
 def _db_conn():

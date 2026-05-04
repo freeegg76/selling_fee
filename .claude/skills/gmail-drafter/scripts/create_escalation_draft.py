@@ -2,7 +2,7 @@
 에스컬레이션용 Gmail Draft 생성기.
 
 FAILED 고객사 발생 시 내부 담당자에게 처리 중단 사유와 필요 조치를 Draft로 전달.
-info@forsit.co.kr 계정으로 impersonate.
+OAuth 2.0으로 info@forsit.co.kr 계정 인증 (첫 실행 시 브라우저 승인 필요).
 
 Usage:
   python create_escalation_draft.py \
@@ -22,7 +22,9 @@ from email.mime.text import MIMEText
 from pathlib import Path
 
 from dotenv import load_dotenv
-from google.oauth2 import service_account
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 
@@ -37,8 +39,8 @@ ROOT = find_project_root()
 load_dotenv(ROOT / ".env")
 
 GMAIL_FROM = os.getenv("GMAIL_FROM", "info@forsit.co.kr")
-CREDENTIALS_FILE = str(ROOT / os.getenv("GOOGLE_CREDENTIALS_FILE", "credential.json"))
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.compose"]
+TOKEN_PATH = str(ROOT / "gmail_token.json")
 
 ESCALATION_RECIPIENTS = [
     e.strip()
@@ -51,10 +53,19 @@ ESCALATION_RECIPIENTS = [
 
 
 def _get_gmail():
-    creds = service_account.Credentials.from_service_account_file(
-        CREDENTIALS_FILE, scopes=GMAIL_SCOPES
-    )
-    return build("gmail", "v1", credentials=creds.with_subject(GMAIL_FROM))
+    client_secret = os.getenv("OAUTH_CLIENT_SECRET", str(ROOT / "oauth_client_secret.json"))
+    creds = None
+    if os.path.exists(TOKEN_PATH):
+        creds = Credentials.from_authorized_user_file(TOKEN_PATH, GMAIL_SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(client_secret, GMAIL_SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open(TOKEN_PATH, "w") as f:
+            f.write(creds.to_json())
+    return build("gmail", "v1", credentials=creds)
 
 
 def _build_body(company_code: str, company_name: str, yyyymm: str,
