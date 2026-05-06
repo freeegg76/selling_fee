@@ -2,12 +2,13 @@
 Revenue Report PDF 생성기.
 
 SP_Get_AmzOrder_By_Client 결과를 ASIN별로 집계하여 Revenue_Report 탭에 주입 후 PDF 내보내기.
-데이터 범위: Revenue_Report!A20:D (ASIN, QTY, Revenue USD, 빈 열)
+데이터 범위: Revenue_Report!A20:E (name_eng, ASIN, QTY, Revenue USD, 빈 열)
 
 Usage:
   python generate_revenue_pdf.py --yyyymm 202504 --company_code ABC --base_dir output
 """
 import argparse
+import json
 import os
 import sys
 from collections import defaultdict
@@ -60,38 +61,70 @@ def _call_sp(sp_name: str, params: dict) -> list:
 # ── ASIN 집계 ────────────────────────────────────────────────────────────────
 
 _MEASURE_FIELDS = [
-    "ItemPrice", "ItemTax", "ShippingPrice", "ShippingTax",
-    "GiftWrapPrice", "GiftWrapTax", "ItemPromotionDiscount", "ShipPromotionDiscount",
+    ("ItemPrice",             "ItemPriceUSD"),
+    ("ItemTax",               "ItemTaxUSD"),
+    ("ShippingPrice",         "ShippingPriceUSD"),
+    ("ShippingTax",           "ShippingTaxUSD"),
+    ("GiftWrapPrice",         "GiftWrapPriceUSD"),
+    ("GiftWrapTax",           "GiftWrapTaxUSD"),
+    ("ItemPromotionDiscount", "ItemPromotionDiscountUSD"),
+    ("ShipPromotionDiscount", "ShipPromotionDiscountUSD"),
 ]
 
 
 def _calc_order_performance(row: dict, measure: dict) -> float:
     """OrderMeasure 룰에 따라 주문 1건의 PerformanceUSD 계산."""
-    fx = float(row.get("FXRate") or 1.0)
+    is_usd = (row.get("Currency") or "USD").upper() == "USD"
     total = 0.0
-    for field in _MEASURE_FIELDS:
-        sign = measure.get(field)
+    for orig_field, usd_field in _MEASURE_FIELDS:
+        sign = measure.get(orig_field)
+        if not sign:
+            continue
+        usd_val = row.get(usd_field)
+        if usd_val is not None:
+            val = float(usd_val)
+        elif is_usd:
+            val = float(row.get(orig_field) or 0)
+        else:
+            val = 0.0  # non-USD 환율 없음 → SP와 동일하게 0 처리
         if sign == "+":
-            total += float(row.get(field) or 0) * fx
+            total += val
         elif sign == "-":
-            total -= float(row.get(field) or 0) * fx
+            total -= val
     return total
 
 
-def _aggregate_by_asin(orders: list, measure: dict) -> list:
-    """ASIN별 QTY·Revenue(USD) 집계. Revenue(USD) = SUM(OrderMeasure 적용 Performance)"""
-    data: dict = defaultdict(lambda: {"qty": 0, "revenue_usd": 0.0})
+def _get_product_names(skus: list) -> dict:
+    """SKU 목록으로 products 테이블에서 name_eng 조회. {sku: name_eng} 반환."""
+    if not skus:
+        return {}
+    conn = _db_conn()
+    try:
+        cur = conn.cursor()
+        placeholders = ",".join("?" * len(skus))
+        cur.execute(f"SELECT sku, name_eng FROM products WHERE sku IN ({placeholders})", skus)
+        return {row[0]: row[1] for row in cur.fetchall()}
+    finally:
+        conn.close()
+
+
+def _aggregate_by_asin(orders: list, measure: dict, product_names: dict) -> list:
+    """ASIN별 QTY·Revenue(USD) 집계. 첫 컬럼은 products.name_eng."""
+    data: dict = defaultdict(lambda: {"qty": 0, "revenue_usd": 0.0, "sku": ""})
 
     for row in orders:
         asin = str(row.get("ASIN") or "")
+        sku = str(row.get("SKU") or "")
         qty = int(row.get("Quantity") or 0)
         rev = _calc_order_performance(row, measure)
 
         data[asin]["qty"] += qty
         data[asin]["revenue_usd"] += rev
+        if not data[asin]["sku"] and sku:
+            data[asin]["sku"] = sku
 
     return [
-        [asin, d["qty"], round(d["revenue_usd"], 2), ""]
+        [product_names.get(d["sku"], ""), asin, d["qty"], round(d["revenue_usd"], 2), ""]
         for asin, d in sorted(data.items())
     ]
 
@@ -164,11 +197,16 @@ def main():
     base = Path(args.base_dir) / args.yyyymm / args.company_code
     out_path = args.output or str(base / "revenue_report.pdf")
 
-    # 주문 데이터
-    orders = _call_sp(
-        "SP_Get_AmzOrder_By_Client",
-        {"@YYYYMM": args.yyyymm, "@CompanyCode": args.company_code},
-    )
+    # 주문 데이터 (STEP 3에서 생성된 orders_usd.json 우선 사용)
+    orders_usd_path = base / "orders_usd.json"
+    if orders_usd_path.exists():
+        with open(orders_usd_path, encoding="utf-8") as f:
+            orders = json.load(f)
+    else:
+        orders = _call_sp(
+            "SP_Get_AmzOrder_By_Client",
+            {"@YYYYMM": args.yyyymm, "@CompanyCode": args.company_code},
+        )
 
     # 고객사 정보
     clients = _call_sp("SP_Get_Client_Info", {"@CompanyCode": args.company_code})
@@ -178,8 +216,12 @@ def main():
     measures = _call_sp("SP_Get_OrderMeasure_By_Client", {"@CompanyCode": args.company_code})
     measure = measures[0] if measures else {}
 
+    # SKU → name_eng 조회
+    skus = list({str(r.get("SKU") or "") for r in orders if r.get("SKU")})
+    product_names = _get_product_names(skus)
+
     # ASIN 집계
-    asin_data = _aggregate_by_asin(orders, measure)
+    asin_data = _aggregate_by_asin(orders, measure, product_names)
 
     replacements = {
         "[회사명]": client.get("company_name", ""),
@@ -188,6 +230,7 @@ def main():
         "[대표자명]": client.get("representative", ""),
         "[별칭]": client.get("alias", ""),
         "[YYYYMM]": args.yyyymm,
+        "YYYYMM": args.yyyymm,
     }
 
     sheets, drive = get_sheets_and_drive()

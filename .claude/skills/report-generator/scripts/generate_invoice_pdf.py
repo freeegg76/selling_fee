@@ -66,7 +66,10 @@ def _dates(yyyymm: str):
     first = date(y, m, 1)
     last = date(y, m, calendar.monthrange(y, m)[1])
     due = first + timedelta(days=14)
-    return first, last, due
+    next_m = m % 12 + 1
+    next_y = y + (1 if m == 12 else 0)
+    invoice_date = date(next_y, next_m, 1)
+    return first, last, due, invoice_date
 
 
 # ── Sheets / Drive 조작 ──────────────────────────────────────────────────────
@@ -144,7 +147,7 @@ def main():
     client = clients[0]
 
     # 날짜 계산
-    first, last, due = _dates(args.yyyymm)
+    first, last, due, invoice_date = _dates(args.yyyymm)
     alias = client.get("alias") or args.company_code
     inv_no = f"{alias}_invoice_amz_selling_{args.yyyymm[:4]}-{args.yyyymm[4:6]}"
 
@@ -157,11 +160,12 @@ def main():
 
     replacements = {
         "[회사명]": client.get("company_name", ""),
+        "[주소]": client.get("address", ""),
         "[사업자번호]": client.get("business_number", ""),
         "[대표자명]": client.get("representative", ""),
         "[인보이스 청구년월]": f"{args.yyyymm[:4]}/{args.yyyymm[4:6]}",
         "[인보이스번호]": inv_no,
-        "[인보이스일자]": str(first),
+        "[인보이스일자]": invoice_date.strftime("%Y/%m/%d"),
         "[지급기한]": str(due),
         "[서비스 기간]": f"{first} ~ {last}",
         "[주문 실적]": f"{float(billing.get('PerformanceUSD', 0)):,.2f}",

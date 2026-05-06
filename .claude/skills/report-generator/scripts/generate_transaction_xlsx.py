@@ -145,10 +145,10 @@ def main():
     clients = _call_sp("SP_Get_Client_Info", {"@CompanyCode": args.company_code})
     client = clients[0] if clients else {}
 
-    # 데이터 행 구성 (SP 컬럼 순서 그대로 B11:T에 기록)
+    # 데이터 행 구성 (첫 번째 컬럼 product name 제외, B11:T에 기록)
     data_rows = []
     if orders:
-        columns = list(orders[0].keys())
+        columns = list(orders[0].keys())[1:]
         for row in orders:
             data_rows.append([_safe_str(row.get(c)) for c in columns])
 

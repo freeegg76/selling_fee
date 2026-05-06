@@ -155,22 +155,58 @@ python .claude/skills/db-caller/scripts/call_sp.py --sp SP_Calc_Tiered_Selling_F
 python .claude/skills/db-caller/scripts/call_sp.py --sp SP_Get_Fixed_Currency \
   --params "{\"@CompanyCode\":\"{CC}\"}" \
   --output output/{YYYYMM}/{CC}/fixed_currency.json
+```
 
+`fixed_currency.json`에서 BillingCurrency 추출.
+
+**KRW 고객사 (BillingCurrency = 'KRW')**:
+ExchangeRate 테이블에는 KRW 행이 없고 USD 행으로 환율을 관리한다.
+반드시 `@Currency = 'USD'`로 조회한 뒤 `USDKRWRate = 1 / rate_value`로 환산한다:
+
+```bash
 python .claude/skills/db-caller/scripts/call_sp.py --sp SP_Get_ExchangeRate_NextMonth \
-  --params "{\"@YYYYMM\":\"{YYYYMM}\",\"@Currency\":\"{currency}\"}" \
+  --params "{\"@YYYYMM\":\"{YYYYMM}\",\"@Currency\":\"USD\"}" \
   --output output/{YYYYMM}/{CC}/exchange_rate.json
 ```
 
-환율이 없으면 SP_Get_ExchangeRate_Fallback 호출 (BaseDate = 익월 초일):
+환율이 없으면 SP_Get_ExchangeRate_Fallback 호출 (BaseDate = 익월 초일, @Currency = 'USD'):
 ```bash
 python .claude/skills/db-caller/scripts/call_sp.py --sp SP_Get_ExchangeRate_Fallback \
-  --params "{\"@BaseDate\":\"{next_month_first}\",\"@Currency\":\"{currency}\"}" \
+  --params "{\"@BaseDate\":\"{next_month_first}\",\"@Currency\":\"USD\"}" \
   --output output/{YYYYMM}/{CC}/exchange_rate.json
 ```
 
-billing.json 생성:
+`exchange_rate.json`의 ExchangeRate 필드 값을 `usd_rate`로 읽은 뒤:
+`USDKRWRate = 1 / usd_rate` (예: usd_rate = 0.000735 → USDKRWRate = 1360.54)
+
+**USD 고객사 (BillingCurrency = 'USD')**:
+환율 조회 절차 전체 생략. `SellingFeeUSD` 값을 그대로 청구금액으로 사용한다.
+`USDKRWRate`, `SellingFeeKRW` 필드 제외.
+
+billing.json 생성 (필드명은 반드시 PascalCase로 정확히 일치):
+
+KRW 고객사:
 ```json
-{"currency":"KRW","exchange_rate":1350.00,"fee_usd":5000.00,"fee_local":6750000,"vat_rate":0.10,"vat_amount":675000,"total_amount":7425000}
+{
+  "PerformanceUSD": 50000.00,
+  "BillingCurrency": "KRW",
+  "USDKRWRate": 1360.54,
+  "SellingFeeUSD": 2500.00,
+  "SellingFeeKRW": 3401350,
+  "VAT": 340135,
+  "TotalAmount": 3741485
+}
+```
+
+USD 고객사 (환율 필드 없음):
+```json
+{
+  "PerformanceUSD": 50000.00,
+  "BillingCurrency": "USD",
+  "SellingFeeUSD": 2500.00,
+  "VAT": 0,
+  "TotalAmount": 2500.00
+}
 ```
 
 **실패 처리**: Fallback도 없으면 에스컬레이션 → FAILED 반환.
