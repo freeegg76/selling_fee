@@ -247,7 +247,9 @@ def run_client(company_code: str, company_name: str):
     print("\n  [STEP 7] 청구 통화 및 환율 적용")
     fixed_currency = call_sp("SP_Get_Fixed_Currency", {"@CompanyCode": company_code})
     save_json(fixed_currency, OUT / "fixed_currency.json")
-    billing_currency = fixed_currency[0].get("BillingCurrency", "KRW") if fixed_currency else "KRW"
+    billing_currency = (fixed_currency[0].get("BillingCurrency")
+                        or fixed_currency[0].get("currency")
+                        or "KRW") if fixed_currency else "KRW"
     print(f"  BillingCurrency: {billing_currency}")
 
     if billing_currency == "KRW":
