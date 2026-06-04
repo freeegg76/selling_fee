@@ -4,11 +4,13 @@ Transaction Report xlsx 생성기.
 SP_Get_AmzOrder_By_Client 결과를 Transaction_Report 탭에 주입하여 xlsx로 내보낸다.
 데이터 범위: Transaction_Report!B11 ~ (헤더 없이 데이터만)
 Performance 열은 SP_Get_OrderMeasure_By_Client 룰 기반으로 산정하여 마지막 열(U)에 추가한다.
+비USD 통화 주문은 orders_usd.json의 *USD 필드(SP_Convert_Order_Amount_To_USD → ConvertFx 기반)로 환산한다.
 
 Usage:
   python generate_transaction_xlsx.py --yyyymm 202504 --company_code ABC --base_dir output
 """
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -27,11 +29,19 @@ TAB_NAME = "Transaction_Report"
 DATA_RANGE_START = "B11"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
-# OrderMeasure 테이블의 가산/차감 대상 필드 (순서 고정)
-MEASURE_FIELDS = [
-    "ItemPrice", "ItemTax", "ShippingPrice", "ShippingTax",
-    "GiftWrapPrice", "GiftWrapTax", "ItemPromotionDiscount", "ShipPromotionDiscount",
+# OrderMeasure 테이블의 가산/차감 대상 필드 (원본 → USD 변환 필드 쌍)
+_MEASURE_FIELD_USD = [
+    ("ItemPrice",             "ItemPriceUSD"),
+    ("ItemTax",               "ItemTaxUSD"),
+    ("ShippingPrice",         "ShippingPriceUSD"),
+    ("ShippingTax",           "ShippingTaxUSD"),
+    ("GiftWrapPrice",         "GiftWrapPriceUSD"),
+    ("GiftWrapTax",           "GiftWrapTaxUSD"),
+    ("ItemPromotionDiscount", "ItemPromotionDiscountUSD"),
+    ("ShipPromotionDiscount", "ShipPromotionDiscountUSD"),
 ]
+# 원본 필드명 목록 (열 순서 유지용)
+MEASURE_FIELDS = [f[0] for f in _MEASURE_FIELD_USD]
 
 # 숫자 타입으로 기록할 시트 열 (B 기준 0-based 인덱스)
 # H=6, J=8, K=9, L=10, M=11, O=13, P=14, Q=15, R=16
@@ -76,15 +86,30 @@ def _call_sp(sp_name: str, params: dict) -> list:
 
 # ── Performance 계산 ──────────────────────────────────────────────────────────
 
-def _calc_performance(order: dict, measure: dict) -> float:
-    """OrderMeasure 룰(+/-/NULL)에 따라 트랜잭션별 Performance를 산정한다."""
+def _calc_performance(order: dict, measure: dict, usd_row: dict = None) -> float:
+    """OrderMeasure 룰(+/-/NULL)에 따라 트랜잭션별 PerformanceUSD를 산정한다.
+
+    비USD 통화는 usd_row의 *USD 필드(ConvertFx 기반 환산값)를 우선 사용한다.
+    usd_row가 없거나 *USD가 null이면 USD 주문에 한해 원본 금액을 그대로 사용한다.
+    """
+    usd_row = usd_row or {}
+    is_usd = (order.get("Currency") or "USD").upper() == "USD"
     total = 0.0
-    for field in MEASURE_FIELDS:
-        sign = measure.get(field)
+    for orig_field, usd_field in _MEASURE_FIELD_USD:
+        sign = measure.get(orig_field)
+        if not sign:
+            continue
+        usd_val = usd_row.get(usd_field)
+        if usd_val is not None:
+            val = float(usd_val)
+        elif is_usd:
+            val = float(order.get(orig_field) or 0)
+        else:
+            val = 0.0  # 비USD이고 *USD도 없으면 0 (환율 미등록 통화)
         if sign == "+":
-            total += float(order.get(field) or 0)
+            total += val
         elif sign == "-":
-            total -= float(order.get(field) or 0)
+            total -= val
     return round(total, 6)
 
 
@@ -213,7 +238,7 @@ def main():
     base = Path(args.base_dir) / args.yyyymm / args.company_code
     out_path = args.output or str(base / "transaction_report.xlsx")
 
-    # 고객사 주문 데이터 조회
+    # 고객사 주문 데이터 조회 (테이블 레이아웃용)
     orders = _call_sp(
         "SP_Get_AmzOrder_By_Client",
         {"@YYYYMM": args.yyyymm, "@CompanyCode": args.company_code},
@@ -221,6 +246,19 @@ def main():
 
     if not orders:
         print(f"WARN: 주문 데이터 없음 ({args.company_code})", file=sys.stderr)
+
+    # USD 환산 데이터 로드 (Performance 계산용 — ConvertFx 기반 *USD 필드)
+    # STEP 3에서 생성된 orders_usd.json 우선 사용, 없으면 SP 직접 호출
+    orders_usd_path = base / "orders_usd.json"
+    if orders_usd_path.exists():
+        with open(orders_usd_path, encoding="utf-8") as f:
+            orders_usd = json.load(f)
+    else:
+        orders_usd = _call_sp(
+            "SP_Convert_Order_Amount_To_USD",
+            {"@YYYYMM": args.yyyymm, "@CompanyCode": args.company_code},
+        )
+    usd_lookup = {r["AmazonOrderId"]: r for r in orders_usd}
 
     # OrderMeasure 조회 (Performance 산정 룰: +/-/NULL)
     measures = _call_sp("SP_Get_OrderMeasure_By_Client", {"@CompanyCode": args.company_code})
@@ -243,7 +281,8 @@ def main():
                     vals.append(_to_num(row.get(c)))
                 else:
                     vals.append(_safe_str(row.get(c)))
-            vals.append(_calc_performance(row, measure))  # Performance (U열, float)
+            usd_row = usd_lookup.get(row.get("AmazonOrderId"), {})
+            vals.append(_calc_performance(row, measure, usd_row))  # Performance (U열, USD 환산)
             data_rows.append(vals)
 
     # Performance 헤더 셀: 데이터 시작 열(B=index 1) + 데이터 컬럼 수
