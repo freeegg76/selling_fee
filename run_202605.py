@@ -218,11 +218,13 @@ def run_client(company_code: str, company_name: str):
 
     # ── STEP 6: 셀링피 계산 (Python 직접) ────────────────────────────────────
     print("\n  [STEP 6] 셀링피 계산 (Python)")
-    rates_list = contract["rates"]
+    rates_list = sorted(contract["rates"], key=lambda r: r["line_number"])
     selling_fee = []
     total_fee_exact = 0.0
-    for tier in sorted(rates_list, key=lambda r: r["line_number"]):
-        lower = float(tier["amount_from"])
+    for i, tier in enumerate(rates_list):
+        # DB의 amount_from은 N+1 정수 방식(300001 등)이므로
+        # Tier 2 이상은 이전 Tier의 amount_to를 lower로 사용해 $1 갭 방지
+        lower = float(rates_list[i - 1]["amount_to"]) if i > 0 else 0.0
         upper = float(tier["amount_to"])
         rate_val = float(tier["rate"])
         applied = max(0.0, min(perf_usd, upper) - lower) if perf_usd > lower else 0.0
