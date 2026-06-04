@@ -77,6 +77,20 @@ python .claude/skills/process-logger/scripts/insert_log.py --yyyymm {YYYYMM} --c
 
 ## STEP 3: 주문 조회 및 USD 환산
 
+**사전 작업**: STEP 3 실행 전 계약 정보와 FX 소스를 먼저 확인한다.
+`SP_Get_Valid_Contract`는 STEP 5에서 재사용하므로 결과를 `contract_base.json`에 저장한다.
+
+```bash
+python .claude/skills/db-caller/scripts/call_sp.py --sp SP_Get_Valid_Contract \
+  --params "{\"@YYYYMM\":\"{YYYYMM}\",\"@CompanyCode\":\"{CC}\"}" \
+  --output output/{YYYYMM}/{CC}/contract_base.json
+```
+
+`contract_base.json`에서 `FX` 필드를 추출하여 `fx_source`로 사용한다.
+FX 필드가 없거나 null이면 → 에스컬레이션 → FAILED 반환.
+
+그 다음 주문 조회 및 USD 환산:
+
 ```bash
 python .claude/skills/db-caller/scripts/call_sp.py --sp SP_Get_AmzOrder_By_Client \
   --params "{\"@YYYYMM\":\"{YYYYMM}\",\"@CompanyCode\":\"{CC}\"}" \
@@ -117,12 +131,10 @@ python .claude/skills/db-caller/scripts/call_sp.py --sp SP_Calc_Order_Performanc
 
 ## STEP 5: 유효 계약 및 요율 조회
 
-```bash
-python .claude/skills/db-caller/scripts/call_sp.py --sp SP_Get_Valid_Contract \
-  --params "{\"@YYYYMM\":\"{YYYYMM}\",\"@CompanyCode\":\"{CC}\"}" \
-  --output output/{YYYYMM}/{CC}/contract_base.json
+`contract_base.json`은 STEP 3 사전 작업에서 이미 저장되어 있다.
+`contract_number`와 `fx_source`는 이미 추출된 상태이므로 요율만 조회한다.
 
-# contract_base.json에서 contract_number를 추출한 뒤:
+```bash
 python .claude/skills/db-caller/scripts/call_sp.py --sp SP_Get_Selling_Fee_Rate \
   --params "{\"@ContractNumber\":\"{contract_number}\"}" \
   --output output/{YYYYMM}/{CC}/rates.json
@@ -139,13 +151,27 @@ contract.json 생성 (contract_number + rates 배열 통합):
 
 ## STEP 6: 초과누진 셀링피 계산
 
-```bash
-python .claude/skills/db-caller/scripts/call_sp.py --sp SP_Calc_Tiered_Selling_Fee \
-  --params "{\"@ContractNumber\":\"{contract_number}\",\"@PerformanceUSD\":{performance_usd}}" \
-  --output output/{YYYYMM}/{CC}/selling_fee.json
+`SP_Calc_Tiered_Selling_Fee`는 내부에서 PerformanceUSD를 재계산하므로 미세 오차가 발생한다.
+`contract.json`의 rates와 `performance.json`의 PerformanceUSD를 사용해 **Python으로 직접 계산**한다.
+
+계산 로직:
+```python
+total_fee_exact = 0.0
+for tier in sorted(rates, key=lambda r: r["line_number"]):
+    lower = float(tier["amount_from"])
+    upper = float(tier["amount_to"])
+    applied = max(0.0, min(performance_usd, upper) - lower) if performance_usd > lower else 0.0
+    total_fee_exact += applied * float(tier["rate"])
+
+selling_fee_usd = round(total_fee_exact, 2)
 ```
 
-**실패 처리**: 자동 재시도 1회 → 실패 시 에스컬레이션.
+selling_fee.json 형식:
+```json
+[{"contract_number":"CN-001","line_number":1,"rate_type":"Flat","amount_from":0,"amount_to":999999999,"rate":0.1,"AppliedAmountUSD":14804.02,"SellingFeeUSD":1480.40}]
+```
+
+**실패 처리**: Python 계산 실패(예: rates.json 누락) 시 에스컬레이션.
 
 ---
 
@@ -159,25 +185,30 @@ python .claude/skills/db-caller/scripts/call_sp.py --sp SP_Get_Fixed_Currency \
 
 `fixed_currency.json`에서 BillingCurrency 추출.
 
+STEP 5에서 저장한 `contract_base.json`에서 `FX` 필드를 읽어 `fx_source`로 사용한다.
+- `FX = 'Google'` → ExchangeRate 테이블 Source = 'Google' 환율 적용
+- `FX = 'FX'` → ExchangeRate 테이블 Source = 'FX' 환율 적용
+- FX 필드가 없거나 null이면 에스컬레이션 → FAILED 반환.
+
 **KRW 고객사 (BillingCurrency = 'KRW')**:
 ExchangeRate 테이블에는 KRW 행이 없고 USD 행으로 환율을 관리한다.
-반드시 `@Currency = 'USD'`로 조회한 뒤 `USDKRWRate = 1 / rate_value`로 환산한다:
+반드시 `@Currency = 'USD'`, `@Source = {fx_source}`로 조회한 뒤 `USDKRWRate = 1 / rate_value`로 환산한다:
 
 ```bash
 python .claude/skills/db-caller/scripts/call_sp.py --sp SP_Get_ExchangeRate_NextMonth \
-  --params "{\"@YYYYMM\":\"{YYYYMM}\",\"@Currency\":\"USD\"}" \
+  --params "{\"@YYYYMM\":\"{YYYYMM}\",\"@Currency\":\"USD\",\"@Source\":\"{fx_source}\"}" \
   --output output/{YYYYMM}/{CC}/exchange_rate.json
 ```
 
-환율이 없으면 SP_Get_ExchangeRate_Fallback 호출 (BaseDate = 익월 초일, @Currency = 'USD'):
+환율이 없으면 SP_Get_ExchangeRate_Fallback 호출 (BaseDate = 익월 초일, 동일한 @Source 유지):
 ```bash
 python .claude/skills/db-caller/scripts/call_sp.py --sp SP_Get_ExchangeRate_Fallback \
-  --params "{\"@BaseDate\":\"{next_month_first}\",\"@Currency\":\"USD\"}" \
+  --params "{\"@BaseDate\":\"{next_month_first}\",\"@Currency\":\"USD\",\"@Source\":\"{fx_source}\"}" \
   --output output/{YYYYMM}/{CC}/exchange_rate.json
 ```
 
-`exchange_rate.json`의 ExchangeRate 필드 값을 `usd_rate`로 읽은 뒤:
-`USDKRWRate = 1 / usd_rate` (예: usd_rate = 0.000735 → USDKRWRate = 1360.54)
+`exchange_rate.json`의 `RateToUSD` 필드 값을 그대로 `USDKRWRate`로 사용한다.
+(예: RateToUSD = 1511.5 → USDKRWRate = 1511.5, 역산 불필요)
 
 **USD 고객사 (BillingCurrency = 'USD')**:
 환율 조회 절차 전체 생략. `SellingFeeUSD` 값을 그대로 청구금액으로 사용한다.
@@ -190,6 +221,7 @@ KRW 고객사:
 {
   "PerformanceUSD": 50000.00,
   "BillingCurrency": "KRW",
+  "FxSource": "Google",
   "USDKRWRate": 1360.54,
   "SellingFeeUSD": 2500.00,
   "SellingFeeKRW": 3401350,
