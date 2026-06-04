@@ -43,9 +43,29 @@ _MEASURE_FIELD_USD = [
 # 원본 필드명 목록 (열 순서 유지용)
 MEASURE_FIELDS = [f[0] for f in _MEASURE_FIELD_USD]
 
-# 숫자 타입으로 기록할 시트 열 (B 기준 0-based 인덱스)
-# H=6, J=8, K=9, L=10, M=11, O=13, P=14, Q=15, R=16
-_NUMERIC_COL_INDICES = {ord(c) - ord('B') for c in "HJKLMNOPQR"}
+# 템플릿 열 레이아웃: (orders_usd 필드명, 숫자여부)
+# B~T (첫 열 name_eng skip), U = Performance (마지막 추가)
+_TEMPLATE_COLUMNS = [
+    ("AmazonOrderId",          False),  # B
+    ("MerchantOrderId",        False),  # C
+    ("PurchaseDate",           False),  # D
+    ("OrderStatus",            False),  # E
+    ("SKU",                    False),  # F
+    ("ASIN",                   False),  # G
+    ("Quantity",               True),   # H
+    ("Currency",               False),  # I
+    ("RateToUSD",              True),   # J: ConvertFx 환율 (FXRate 대체)
+    ("ItemPrice",              True),   # K
+    ("ItemTax",                True),   # L
+    ("ShippingPrice",          True),   # M
+    ("ShippingTax",            True),   # N
+    ("GiftWrapPrice",          True),   # O
+    ("GiftWrapTax",            True),   # P
+    ("ItemPromotionDiscount",  True),   # Q
+    ("ShipPromotionDiscount",  True),   # R
+    ("ShipCity",               False),  # S
+    ("PromotionIds",           False),  # T
+]
 
 # 행 높이 설정 (row_index 0-based, pixel_size)
 ROW_HEIGHTS = [
@@ -238,17 +258,8 @@ def main():
     base = Path(args.base_dir) / args.yyyymm / args.company_code
     out_path = args.output or str(base / "transaction_report.xlsx")
 
-    # 고객사 주문 데이터 조회 (테이블 레이아웃용)
-    orders = _call_sp(
-        "SP_Get_AmzOrder_By_Client",
-        {"@YYYYMM": args.yyyymm, "@CompanyCode": args.company_code},
-    )
-
-    if not orders:
-        print(f"WARN: 주문 데이터 없음 ({args.company_code})", file=sys.stderr)
-
-    # USD 환산 데이터 로드 (Performance 계산용 — ConvertFx 기반 *USD 필드)
-    # STEP 3에서 생성된 orders_usd.json 우선 사용, 없으면 SP 직접 호출
+    # USD 환산 데이터 로드 (orders_usd.json 우선, 없으면 SP 직접 호출)
+    # orders_usd를 단일 데이터 소스로 사용: 원본 금액 + *USD 변환값 + RateToUSD 포함
     orders_usd_path = base / "orders_usd.json"
     if orders_usd_path.exists():
         with open(orders_usd_path, encoding="utf-8") as f:
@@ -258,7 +269,9 @@ def main():
             "SP_Convert_Order_Amount_To_USD",
             {"@YYYYMM": args.yyyymm, "@CompanyCode": args.company_code},
         )
-    usd_lookup = {r["AmazonOrderId"]: r for r in orders_usd}
+
+    if not orders_usd:
+        print(f"WARN: 주문 데이터 없음 ({args.company_code})", file=sys.stderr)
 
     # OrderMeasure 조회 (Performance 산정 룰: +/-/NULL)
     measures = _call_sp("SP_Get_OrderMeasure_By_Client", {"@CompanyCode": args.company_code})
@@ -268,25 +281,19 @@ def main():
     clients = _call_sp("SP_Get_Client_Info", {"@CompanyCode": args.company_code})
     client = clients[0] if clients else {}
 
-    # 데이터 행 구성 (첫 번째 컬럼 product name 제외, B11부터 기록)
-    # H,J,K,L,M,O,P,Q,R 열은 숫자 타입, Performance(U열)는 float으로 마지막에 추가
+    # 데이터 행 구성: _TEMPLATE_COLUMNS 레이아웃으로 orders_usd 직접 사용
+    # J열(RateToUSD)은 ConvertFx 기반 실제 환율, Performance는 *USD 필드로 정확 계산
     data_rows = []
-    columns = []
-    if orders:
-        columns = list(orders[0].keys())[1:]
-        for row in orders:
-            vals = []
-            for i, c in enumerate(columns):
-                if i in _NUMERIC_COL_INDICES:
-                    vals.append(_to_num(row.get(c)))
-                else:
-                    vals.append(_safe_str(row.get(c)))
-            usd_row = usd_lookup.get(row.get("AmazonOrderId"), {})
-            vals.append(_calc_performance(row, measure, usd_row))  # Performance (U열, USD 환산)
-            data_rows.append(vals)
+    for row in orders_usd:
+        vals = []
+        for field, is_num in _TEMPLATE_COLUMNS:
+            v = row.get(field)
+            vals.append(_to_num(v) if is_num else _safe_str(v))
+        vals.append(_calc_performance(row, measure, row))  # row 자체에 *USD 필드 포함
+        data_rows.append(vals)
 
-    # Performance 헤더 셀: 데이터 시작 열(B=index 1) + 데이터 컬럼 수
-    perf_col = _col_letter(1 + len(columns))
+    # Performance 헤더 셀 (U열)
+    perf_col = _col_letter(1 + len(_TEMPLATE_COLUMNS))
     perf_header_range = f"{perf_col}10"
 
     # 플레이스홀더
@@ -308,8 +315,7 @@ def main():
         _find_replace(sheets, temp_id, replacements)
         if data_rows:
             _write_data(sheets, temp_id, DATA_RANGE_START, data_rows)
-        if columns:
-            _write_data(sheets, temp_id, perf_header_range, [["Performance"]])
+        _write_data(sheets, temp_id, perf_header_range, [["Performance"]])
         _set_row_heights(sheets, temp_id, sheet_id, ROW_HEIGHTS)
         _export_xlsx(drive, temp_id, out_path)
         print(f"Transaction Report 생성 완료: {out_path} ({len(data_rows)}행)")

@@ -50,6 +50,40 @@ def run_script(script_path, args_list):
     return result.returncode, stdout, stderr
 
 
+_MFUSD_PAIRS = [
+    ("ItemPrice",             "ItemPriceUSD"),
+    ("ItemTax",               "ItemTaxUSD"),
+    ("ShippingPrice",         "ShippingPriceUSD"),
+    ("ShippingTax",           "ShippingTaxUSD"),
+    ("GiftWrapPrice",         "GiftWrapPriceUSD"),
+    ("GiftWrapTax",           "GiftWrapTaxUSD"),
+    ("ItemPromotionDiscount", "ItemPromotionDiscountUSD"),
+    ("ShipPromotionDiscount", "ShipPromotionDiscountUSD"),
+]
+
+
+def _calc_order_perf(row: dict, msr: dict) -> float:
+    """orders_usd 행 1건의 PerformanceUSD를 OrderMeasure 룰로 계산."""
+    is_usd = (row.get("Currency") or "USD").upper() == "USD"
+    total = 0.0
+    for orig, usd_f in _MFUSD_PAIRS:
+        sign = msr.get(orig)
+        if not sign:
+            continue
+        usd_val = row.get(usd_f)
+        if usd_val is not None:
+            val = float(usd_val)
+        elif is_usd:
+            val = float(row.get(orig) or 0)
+        else:
+            val = 0.0
+        if sign == "+":
+            total += val
+        elif sign == "-":
+            total -= val
+    return total
+
+
 def run_client(company_code: str, company_name: str):
     OUT = OUT_BASE / company_code
     print(f"\n{'='*60}")
@@ -132,15 +166,13 @@ def run_client(company_code: str, company_name: str):
         log("STEP4", "FAILED", "OrderMeasure 없음")
         return f"FAILED: {company_name} - STEP4 - OrderMeasure 없음"
 
-    performance = call_sp("SP_Calc_Order_Performance_By_Measure", {"@YYYYMM": YYYYMM, "@CompanyCode": company_code})
+    # Python 직접 계산 (ConvertFx 기반 orders_usd.json 사용 → SP_Calc 대체)
+    measure = order_measure[0]
+    orders_usd_list = load_json(OUT / "orders_usd.json")
+    perf_usd = round(sum(_calc_order_perf(r, measure) for r in orders_usd_list), 2)
+    performance = [{"Period": YYYYMM, "company_code": company_code,
+                    "company_name": company_name, "PerformanceUSD": perf_usd}]
     save_json(performance, OUT / "performance.json")
-
-    if not performance or performance[0].get("PerformanceUSD") is None:
-        escalate("STEP4", "performance_usd 값 없음")
-        log("STEP4", "FAILED", "PerformanceUSD 없음")
-        return f"FAILED: {company_name} - STEP4 - PerformanceUSD 없음"
-
-    perf_usd = float(performance[0]["PerformanceUSD"])
     print(f"  PerformanceUSD: {perf_usd}")
 
     # 전월 비교
