@@ -31,14 +31,21 @@ def load_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def _decode_output(b: bytes) -> str:
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        return b.decode("cp949", errors="replace")
+
+
 def run_script(script_path, args_list):
     cmd = [PYTHON, str(ROOT / script_path)] + args_list
     result = subprocess.run(cmd, capture_output=True, cwd=str(ROOT))
-    stdout = result.stdout.decode("utf-8", errors="replace")
-    stderr = result.stderr.decode("utf-8", errors="replace")
-    if stdout:
+    stdout = _decode_output(result.stdout)
+    stderr = _decode_output(result.stderr)
+    if stdout.strip():
         print(f"    stdout: {stdout.strip()}")
-    if stderr:
+    if stderr.strip():
         print(f"    stderr: {stderr.strip()}")
     return result.returncode, stdout, stderr
 
@@ -325,58 +332,63 @@ def run_client(company_code: str, company_name: str):
     return final_status
 
 
-# ── STEP 1: 처리 대상 고객사 조회 ─────────────────────────────────────────────
-print("\n=== STEP 1: 처리 대상 고객사 조회 ===")
-clients_raw = call_sp("SP_Get_AmzOrder_By_Period", {"@YYYYMM": YYYYMM})
-save_json(clients_raw, OUT_BASE / "clients_raw.json")
-print(f"  전체 주문 건수: {len(clients_raw)}")
+def main():
+    # ── STEP 1: 처리 대상 고객사 조회 ─────────────────────────────────────────
+    print("\n=== STEP 1: 처리 대상 고객사 조회 ===")
+    clients_raw = call_sp("SP_Get_AmzOrder_By_Period", {"@YYYYMM": YYYYMM})
+    save_json(clients_raw, OUT_BASE / "clients_raw.json")
+    print(f"  전체 주문 건수: {len(clients_raw)}")
 
-if not clients_raw:
-    print("ERROR: 주문 데이터 없음. 에스컬레이션 필요.")
-    sys.exit(1)
+    if not clients_raw:
+        print("ERROR: 주문 데이터 없음. 에스컬레이션 필요.")
+        sys.exit(1)
 
-# 고유 고객사 추출 (SP 결과의 'Client' 컬럼 = company_code)
-seen_codes = set()
-client_codes = []
-for row in clients_raw:
-    code = row.get("company_code") or row.get("Client")
-    if code and code not in seen_codes:
-        seen_codes.add(code)
-        client_codes.append(code)
+    # 고유 고객사 추출 (SP 결과의 'Client' 컬럼 = company_code)
+    seen_codes = set()
+    client_codes = []
+    for row in clients_raw:
+        code = row.get("company_code") or row.get("Client")
+        if code and code not in seen_codes:
+            seen_codes.add(code)
+            client_codes.append(code)
 
-# 각 고객사 이름 조회
-clients = []
-for code in client_codes:
-    info = call_sp("SP_Get_Client_Info", {"@CompanyCode": code})
-    name = info[0].get("company_name", code) if info else code
-    clients.append({"company_code": code, "company_name": name})
+    # 각 고객사 이름 조회
+    clients = []
+    for code in client_codes:
+        info = call_sp("SP_Get_Client_Info", {"@CompanyCode": code})
+        name = info[0].get("company_name", code) if info else code
+        clients.append({"company_code": code, "company_name": name})
 
-save_json(clients, OUT_BASE / "clients.json")
-print(f"  고객사 수: {len(clients)}")
-for c in clients:
-    print(f"    - {c['company_code']}: {c['company_name']}")
+    save_json(clients, OUT_BASE / "clients.json")
+    print(f"  고객사 수: {len(clients)}")
+    for c in clients:
+        print(f"    - {c['company_code']}: {c['company_name']}")
 
-# ── STEP 2: 고객사별 순차 처리 ────────────────────────────────────────────────
-print(f"\n=== STEP 2~11: {len(clients)}개 고객사 처리 시작 ===")
+    # ── STEP 2: 고객사별 순차 처리 ────────────────────────────────────────────
+    print(f"\n=== STEP 2~11: {len(clients)}개 고객사 처리 시작 ===")
 
-results = {}
-for c in clients:
-    try:
-        result = run_client(c["company_code"], c["company_name"])
-        results[c["company_code"]] = {"name": c["company_name"], "status": result}
-    except Exception as e:
-        results[c["company_code"]] = {"name": c["company_name"], "status": f"FAILED: {e}"}
-        print(f"\n  [EXCEPTION] {c['company_name']}: {e}")
+    results = {}
+    for c in clients:
+        try:
+            result = run_client(c["company_code"], c["company_name"])
+            results[c["company_code"]] = {"name": c["company_name"], "status": result}
+        except Exception as e:
+            results[c["company_code"]] = {"name": c["company_name"], "status": f"FAILED: {e}"}
+            print(f"\n  [EXCEPTION] {c['company_name']}: {e}")
 
-# ── STEP 12: 전체 결과 집계 ───────────────────────────────────────────────────
-print(f"\n{'='*60}")
-print(f"=== 판매수수료 정산 완료 ({YYYYMM}) ===")
-print(f"{'='*60}")
+    # ── STEP 12: 전체 결과 집계 ───────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print(f"=== 판매수수료 정산 완료 ({YYYYMM}) ===")
+    print(f"{'='*60}")
 
-success = [k for k, v in results.items() if v["status"] == "SUCCESS"]
-partial = [k for k, v in results.items() if isinstance(v["status"], str) and "PARTIAL" in v["status"]]
-failed  = [k for k, v in results.items() if isinstance(v["status"], str) and "FAILED" in v["status"]]
+    success = [k for k, v in results.items() if v["status"] == "SUCCESS"]
+    partial = [k for k, v in results.items() if isinstance(v["status"], str) and "PARTIAL" in v["status"]]
+    failed  = [k for k, v in results.items() if isinstance(v["status"], str) and "FAILED" in v["status"]]
 
-print(f"SUCCESS : {len(success)}개사")
-print(f"PARTIAL : {len(partial)}개사" + (f" → {[results[k]['name'] for k in partial]}" if partial else ""))
-print(f"FAILED  : {len(failed)}개사" + (f" → {[results[k]['name'] for k in failed]}" if failed else ""))
+    print(f"SUCCESS : {len(success)}개사")
+    print(f"PARTIAL : {len(partial)}개사" + (f" → {[results[k]['name'] for k in partial]}" if partial else ""))
+    print(f"FAILED  : {len(failed)}개사" + (f" → {[results[k]['name'] for k in failed]}" if failed else ""))
+
+
+if __name__ == "__main__":
+    main()
